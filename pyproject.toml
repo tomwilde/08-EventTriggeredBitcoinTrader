@@ -1,0 +1,38 @@
+[project]
+name = "event-triggered-automation-agent"
+version = "0.1.0"
+description = "Streamlit event-triggered bitcoin automation agent"
+requires-python = ">=3.12"
+dependencies = [
+  "streamlit>=1.40",
+  "requests>=2.32.0",
+  "feedparser>=6.0.11",
+  "beautifulsoup4>=4.12.3",
+  "pika>=1.3.2",
+  "plotly>=6.0.0",
+  "openai>=1.55.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.3",
+  "ruff>=0.8.0",
+  "ty>=0.0.1a16",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.ruff]
+line-length = 100
+extend-exclude = [
+  "bitcoin-price.py",
+  "news.py",
+]
+
+[tool.ruff.lint]
+ignore = ["UP047"]
+
+[tool.ty.src]
+include = ["src", "app.py", "tests"]
