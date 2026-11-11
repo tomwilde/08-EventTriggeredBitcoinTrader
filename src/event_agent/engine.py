@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import logging
+import sys
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -14,6 +16,7 @@ from .indicators import exponential_moving_average
 from .jev import build_jev_submission
 from .models import AppState, Movement, Outlook, Prediction
 from .prediction import (
+    HeuristicJevAdvisor,
     JevAdvisor,
     OutlookAnalyzer,
     build_jev_advisor,
@@ -32,6 +35,16 @@ STARTUP_EMA_WINDOWS: dict[str, timedelta] = {
     "10_mins": timedelta(minutes=10),
     "5_mins": timedelta(minutes=5),
 }
+STARTUP_VISIBLE_HISTORY_DAYS = 30
+STARTUP_PRELOAD_MULTIPLIER = 2
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(stdout_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 
 class AutomationEngine:
@@ -46,6 +59,7 @@ class AutomationEngine:
         self.broker = self._build_broker()
         self.outlook_analyzer = outlook_analyzer or build_outlook_analyzer()
         self.jev_advisor = jev_advisor or build_jev_advisor()
+        self._startup_replay_advisor = HeuristicJevAdvisor()
         self.price_scheduler = NonOverlappingScheduler()
         self._open_trade: OpenTrade | None = None
         self._background_thread: threading.Thread | None = None
@@ -56,6 +70,7 @@ class AutomationEngine:
         self.current_poll_interval_seconds = 0.0
         self._last_jev_decision_at: datetime | None = None
         self._next_price_attempt_at: datetime | None = None
+        self._visible_price_start_index = 0
 
     def _record_dead_letter(self, *, kind: str, error: str) -> None:
         timestamp = datetime.now(UTC).isoformat(timespec="seconds")
@@ -95,26 +110,57 @@ class AutomationEngine:
 
             now = datetime.now(UTC)
             try:
-                history = fetch_bitcoin_price_history(days=30)
+                logger.info("startup step=1 message='startup begin'")
+                history: list[Movement] = []
+                logger.info(
+                    "startup step=2 message='history preload begin' days=%s",
+                    STARTUP_VISIBLE_HISTORY_DAYS * STARTUP_PRELOAD_MULTIPLIER,
+                )
+                history = fetch_bitcoin_price_history(
+                    days=STARTUP_VISIBLE_HISTORY_DAYS * STARTUP_PRELOAD_MULTIPLIER
+                )
                 if history:
-                    self.state.prices = history
+                    logger.info("startup step=2 message='history preload result count' points=%s", len(history))
+                    self.state.prices = list(history)
+                    self._visible_price_start_index = 0
                     self._recompute_moving_averages()
+                else:
+                    logger.warning("startup step=7 message='failure/fallback' detail='no history returned'")
                 self.state.startup_emas = self._compute_startup_emas()
+                logger.info("startup step=3 message='EMA computed'")
 
                 next_halving_at = estimate_next_bitcoin_halving_datetime(now=now)
                 self.state.next_halving_at = next_halving_at
+                logger.info("startup step=4 message='halving estimate computed'")
                 self.state.market_outlook = self.outlook_analyzer.analyze(
                     stories=[],
                     startup_emas=self.state.startup_emas,
                     next_halving_at=next_halving_at,
                     now=now,
                 )
+                logger.info("startup step=5 message='outlook result' value=%s", self.state.market_outlook)
+
+                if history:
+                    replay_started_at = time.perf_counter()
+                    logger.info(
+                        "startup step=6 message='replay begin' visible_points=%s",
+                        len(history) - max(1, len(history) // 2),
+                    )
+                    self._replay_startup_history(history)
+                    replay_elapsed_seconds = time.perf_counter() - replay_started_at
+                    logger.info(
+                        "startup step=6 message='replay complete' elapsed_seconds=%.3f",
+                        replay_elapsed_seconds,
+                    )
             except (requests.RequestException, ValueError, KeyError) as error:
+                logger.exception("startup step=7 message='failure/fallback' error=%s", error)
                 self._record_dead_letter(kind="startup_failure", error=str(error))
                 if not self.state.prices:
                     try:
+                        logger.warning("startup step=7 message='failure/fallback' detail='fallback live fetch'")
                         self.state.prices = [fetch_bitcoin_price()]
                     except requests.RequestException:
+                        logger.error("startup step=7 message='failure/fallback' detail='fallback zero price'")
                         self.state.prices = [Movement(timestamp=now, price=0.0)]
                 self._recompute_moving_averages()
                 if not self.state.startup_emas:
@@ -125,6 +171,7 @@ class AutomationEngine:
                     self.state.market_outlook = "bullish"
             finally:
                 self.state.startup_complete = True
+                logger.info("startup step=8 message='startup complete'")
 
     @staticmethod
     def _build_broker() -> InMemoryBroker | RabbitMQBroker:
@@ -179,6 +226,41 @@ class AutomationEngine:
             fallback = self.state.prices[-1].price
             result[key] = float(latest if latest is not None else fallback)
         return result
+
+    def _replay_startup_history(self, history: list[Movement]) -> None:
+        if len(history) < 2:
+            self.state.prices = list(history)
+            self._visible_price_start_index = 0
+            self._recompute_moving_averages()
+            return
+
+        split_index = max(1, len(history) // 2)
+        warmup = history[:split_index]
+        visible = history[split_index:]
+
+        self.state.prices = list(warmup)
+        self._visible_price_start_index = len(warmup)
+        self._recompute_moving_averages()
+
+        for movement in visible:
+            self.state.prices.append(movement)
+            self._recompute_moving_averages()
+
+            if self._open_trade:
+                settled = self.book.settle_trade(self._open_trade, movement)
+                self.state.settled_trades.append(settled)
+                self._open_trade = None
+
+            self._execute_jev_trade_decision(
+                movement,
+                decision_time=movement.timestamp,
+                enforce_interval=False,
+                allow_during_startup=True,
+                advisor_override=self._startup_replay_advisor,
+            )
+
+        if visible:
+            self._last_jev_decision_at = visible[-1].timestamp
 
     def adjust_poll_interval(self, outcome: Literal["success", "rate_limited", "error", "skipped"]) -> None:
         now = datetime.now(UTC)
@@ -251,25 +333,35 @@ class AutomationEngine:
         self.consume_prices()
         return "success"
 
-    def _execute_jev_trade_decision(self, latest: Movement) -> None:
+    def _execute_jev_trade_decision(
+        self,
+        latest: Movement,
+        *,
+        decision_time: datetime | None = None,
+        enforce_interval: bool = True,
+        allow_during_startup: bool = False,
+        advisor_override: JevAdvisor | None = None,
+    ) -> None:
         outlook = self.state.market_outlook
-        if not self.state.startup_complete or outlook is None:
+        if ((not self.state.startup_complete) and (not allow_during_startup)) or outlook is None:
             return
 
-        if self._last_jev_decision_at is not None:
-            elapsed = (datetime.now(UTC) - self._last_jev_decision_at).total_seconds()
+        timestamp = decision_time or datetime.now(UTC)
+
+        if enforce_interval and self._last_jev_decision_at is not None:
+            elapsed = (timestamp - self._last_jev_decision_at).total_seconds()
             if elapsed < self.jev_interval_seconds:
                 return
 
-        decision_time = datetime.now(UTC)
         snapshot = build_jev_submission(self.state.prices)
-        decision = self.jev_advisor.decide(
+        advisor = advisor_override or self.jev_advisor
+        decision = advisor.decide(
             snapshot=snapshot,
             outlook=outlook,
-            now=decision_time,
+            now=timestamp,
         )
         self.state.jev_decisions.append(decision)
-        self._last_jev_decision_at = decision_time
+        self._last_jev_decision_at = timestamp
 
         if decision.action == "HOLD":
             return
@@ -306,7 +398,10 @@ class AutomationEngine:
             self.state.settled_trades.append(settled)
             self._open_trade = None
 
-        self._execute_jev_trade_decision(latest)
+        self._execute_jev_trade_decision(latest, decision_time=latest.timestamp)
+
+    def visible_prices(self) -> list[Movement]:
+        return self.state.prices[self._visible_price_start_index :]
 
     def get_dead_letters_page(self, page: int, page_size: int = 25) -> list[str]:
         if page_size <= 0:
@@ -318,16 +413,19 @@ class AutomationEngine:
         return self.state.dead_letters[start:end]
 
     def chart_points(self) -> dict[str, list[float] | list[float | None]]:
-        prices = [point.price for point in self.state.prices]
+        visible_prices = self.visible_prices()
+        prices = [point.price for point in visible_prices]
         payload: dict[str, list[float] | list[float | None]] = {"price": prices}
         for window, series in self.state.moving_averages.items():
-            payload[f"ma_{window}"] = series
+            payload[f"ma_{window}"] = series[self._visible_price_start_index :]
 
         baseline = min(prices) * 0.98 if prices else 0.0
         marker_points: list[float | None] = [None] * len(prices)
+        index_by_timestamp = {point.timestamp: idx for idx, point in enumerate(visible_prices)}
         for trade in self.state.settled_trades:
-            if trade.exit in self.state.prices:
-                marker_points[self.state.prices.index(trade.exit)] = baseline
+            idx = index_by_timestamp.get(trade.exit.timestamp)
+            if idx is not None:
+                marker_points[idx] = baseline
         payload["prediction_markers"] = marker_points
         return payload
 

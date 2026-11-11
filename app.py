@@ -24,7 +24,7 @@ if is_test_mode and not engine.ui_ready:
     engine.state.market_outlook = "bullish"
 
 if not engine.ui_ready:
-    with st.spinner("Preparing startup context (prices, halving, outlook)..."):
+    with st.spinner("Preparing startup context "):
         engine.initialize_startup_context()
 
 if not is_test_mode and not engine.is_running:
@@ -69,7 +69,7 @@ PANEL_REFRESH_SECONDS = 5
 
 
 def _chart_signature() -> tuple[int, str | None, float | None, int]:
-    prices = engine.state.prices
+    prices = engine.visible_prices()
     latest_timestamp = prices[-1].timestamp.isoformat() if prices else None
     latest_price = prices[-1].price if prices else None
     return (len(prices), latest_timestamp, latest_price, len(engine.state.settled_trades))
@@ -112,7 +112,8 @@ def _rolling_volatility_percent(prices: list[float], window: int = 30) -> list[f
 def _build_figure() -> go.Figure:
     series = engine.chart_points()
     figure = go.Figure()
-    x_values = [item.timestamp for item in engine.state.prices]
+    visible_prices = engine.visible_prices()
+    x_values = [item.timestamp for item in visible_prices]
     volatility = _rolling_volatility_percent(series["price"])
 
     for key, values in series.items():
@@ -142,7 +143,7 @@ def _build_figure() -> go.Figure:
                 (
                     trade
                     for trade in engine.state.settled_trades
-                    if engine.state.prices[idx].timestamp == trade.exit.timestamp
+                    if visible_prices[idx].timestamp == trade.exit.timestamp
                 ),
                 None,
             )
@@ -213,8 +214,9 @@ def _build_figure() -> go.Figure:
 
 def _render_price_chart_panel() -> None:
     st.plotly_chart(_build_figure(), width="stretch", key="price_chart")
-    if engine.state.prices:
-        latest = engine.state.prices[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+    visible_prices = engine.visible_prices()
+    if visible_prices:
+        latest = visible_prices[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
         st.caption(f"Last updated: {latest}")
 
 
@@ -340,8 +342,9 @@ def render_live_chart_polling(chart_slot, chart_meta_slot) -> None:
         chart_slot.plotly_chart(_build_figure(), width="stretch", key="price_chart")
         st.session_state["chart_render_signature"] = signature
 
-    if engine.state.prices:
-        latest = engine.state.prices[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+    visible_prices = engine.visible_prices()
+    if visible_prices:
+        latest = visible_prices[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
         chart_meta_slot.caption(f"Last updated: {latest}")
     else:
         chart_meta_slot.caption("Last updated: -")

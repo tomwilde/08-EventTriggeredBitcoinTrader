@@ -203,6 +203,7 @@ def test_jev_decision_runs_at_most_once_per_two_minutes(monkeypatch: pytest.Monk
 
 def test_phase2_startup_initialization_builds_outlook_and_ema_windows(monkeypatch: pytest.MonkeyPatch):
     from event_agent.engine import AutomationEngine
+    from event_agent.models import JevDecision
 
     class _OutlookAnalyzer:
         def analyze(self, *, stories, startup_emas, next_halving_at, now):
@@ -210,7 +211,13 @@ def test_phase2_startup_initialization_builds_outlook_and_ema_windows(monkeypatc
 
     class _JevAdvisor:
         def decide(self, *, snapshot, outlook, now):
-            raise AssertionError("not used in startup test")
+            return JevDecision(
+                timestamp=now,
+                action="HOLD",
+                confidence=0.5,
+                rationale_token="no_edge",
+                outlook=outlook,
+            )
 
     base = datetime(2026, 10, 1, tzinfo=UTC)
     history = [
@@ -218,7 +225,7 @@ def test_phase2_startup_initialization_builds_outlook_and_ema_windows(monkeypatc
         for idx in range(24 * 30)
     ]
 
-    monkeypatch.setattr("event_agent.engine.fetch_bitcoin_price_history", lambda days=30: history)
+    monkeypatch.setattr("event_agent.engine.fetch_bitcoin_price_history", lambda days=60: history)
     monkeypatch.setattr(
         "event_agent.engine.estimate_next_bitcoin_halving_datetime",
         lambda now=None: datetime(2028, 4, 20, tzinfo=UTC),
@@ -264,7 +271,7 @@ def test_phase2_new_price_uses_jev_decision_for_paper_trade(monkeypatch: pytest.
         for idx in range(24 * 30)
     ]
 
-    monkeypatch.setattr("event_agent.engine.fetch_bitcoin_price_history", lambda days=30: history)
+    monkeypatch.setattr("event_agent.engine.fetch_bitcoin_price_history", lambda days=60: history)
     monkeypatch.setattr(
         "event_agent.engine.estimate_next_bitcoin_halving_datetime",
         lambda now=None: datetime(2028, 4, 20, tzinfo=UTC),
@@ -283,6 +290,66 @@ def test_phase2_new_price_uses_jev_decision_for_paper_trade(monkeypatch: pytest.
     assert engine.state.predictions[-1].direction == "up"
     assert engine.state.predictions[-1].magnitude == 4
     assert engine.open_trade is not None
+
+
+def test_startup_replays_visible_half_with_heuristic_and_charts_second_half_only(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.engine import AutomationEngine
+    from event_agent.models import JevDecision
+
+    class _OutlookAnalyzer:
+        def analyze(self, *, stories, startup_emas, next_halving_at, now):
+            return "bullish"
+
+    class _JevAdvisor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def decide(self, *, snapshot, outlook, now):
+            self.calls += 1
+            return JevDecision(
+                timestamp=now,
+                action="BUY",
+                confidence=0.8,
+                rationale_token="live_advisor",
+                outlook=outlook,
+            )
+
+    base = datetime(2026, 10, 1, tzinfo=UTC)
+    history = [
+        Movement(timestamp=base + timedelta(hours=idx), price=50000.0 + (idx * 100.0))
+        for idx in range(6)
+    ]
+
+    captured_days: list[int] = []
+
+    def _fake_fetch_history(days: int = 60):
+        captured_days.append(days)
+        return history
+
+    monkeypatch.setattr("event_agent.engine.fetch_bitcoin_price_history", _fake_fetch_history)
+    monkeypatch.setattr(
+        "event_agent.engine.estimate_next_bitcoin_halving_datetime",
+        lambda now=None: datetime(2028, 4, 20, tzinfo=UTC),
+    )
+
+    advisor = _JevAdvisor()
+    engine = AutomationEngine(outlook_analyzer=_OutlookAnalyzer(), jev_advisor=advisor)
+    engine.initialize_startup_context()
+
+    assert captured_days == [60]
+    assert len(engine.state.prices) == 6
+    assert advisor.calls == 0
+    assert len(engine.state.jev_decisions) == 3
+
+    chart = engine.chart_points()
+    assert chart["price"] == [50300.0, 50400.0, 50500.0]
+
+    live_movement = Movement(timestamp=base + timedelta(hours=6), price=50600.0)
+    monkeypatch.setattr("event_agent.engine.fetch_bitcoin_price", lambda: live_movement)
+
+    assert engine.run_price_cycle() == "success"
+    assert advisor.calls == 1
+    assert engine.state.predictions[-1].rationale == "live_advisor"
 
 
 def test_openrouter_jev_advisor_uses_decisions_endpoint(monkeypatch: pytest.MonkeyPatch):
