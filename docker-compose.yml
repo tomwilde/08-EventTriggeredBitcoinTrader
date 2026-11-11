@@ -12,7 +12,13 @@ services:
       dockerfile: Dockerfile
     environment:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      USE_OLLAMA: ${USE_OLLAMA:-1}
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+      SYSTEM_ONE_MODEL: ${SYSTEM_ONE_MODEL:-gemma4:e2b}
+      SYSTEM_TWO_MODEL: ${SYSTEM_TWO_MODEL:-gemma4:12b}
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - rabbitmq
     ports:
@@ -25,7 +31,13 @@ services:
     profiles: ["debug"]
     environment:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      USE_OLLAMA: ${USE_OLLAMA:-1}
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+      SYSTEM_ONE_MODEL: ${SYSTEM_ONE_MODEL:-gemma4:e2b}
+      SYSTEM_TWO_MODEL: ${SYSTEM_TWO_MODEL:-gemma4:12b}
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - rabbitmq
     volumes:

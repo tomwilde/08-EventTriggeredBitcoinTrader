@@ -33,12 +33,6 @@ if not is_test_mode and not engine.is_running:
 st.title("Event-Triggered Bitcoin Automation Agent")
 
 EMA_LABELS = {
-    "1_month": "EMA 1M",
-    "3_weeks": "EMA 3W",
-    "2_weeks": "EMA 2W",
-    "1_week": "EMA 1W",
-    "3_day": "EMA 3D",
-    "1_day": "EMA 1D",
     "12_hours": "EMA 12H",
     "6_hours": "EMA 6H",
     "1_hour": "EMA 1H",
@@ -54,12 +48,6 @@ EMA_COLOR_KEYS_SHORTEST_TO_LONGEST = [
     "1_hour",
     "6_hours",
     "12_hours",
-    "1_day",
-    "3_day",
-    "1_week",
-    "2_weeks",
-    "3_weeks",
-    "1_month",
 ]
 
 EMA_COLORS_SHORTEST_TO_LONGEST = [
@@ -69,18 +57,22 @@ EMA_COLORS_SHORTEST_TO_LONGEST = [
     "#2a66c6",
     "#255cb6",
     "#1f53a6",
-    "#1a4996",
-    "#154086",
-    "#103676",
-    "#0a2d66",
-    "#052356",
-    "#001a46",
 ]
 
 EMA_LINE_COLORS = {
     key: EMA_COLORS_SHORTEST_TO_LONGEST[idx]
     for idx, key in enumerate(EMA_COLOR_KEYS_SHORTEST_TO_LONGEST)
 }
+
+CHART_REFRESH_SECONDS = 15
+PANEL_REFRESH_SECONDS = 5
+
+
+def _chart_signature() -> tuple[int, str | None, float | None, int]:
+    prices = engine.state.prices
+    latest_timestamp = prices[-1].timestamp.isoformat() if prices else None
+    latest_price = prices[-1].price if prices else None
+    return (len(prices), latest_timestamp, latest_price, len(engine.state.settled_trades))
 
 
 def _format_countdown(seconds: int) -> str:
@@ -219,53 +211,55 @@ def _build_figure() -> go.Figure:
     return figure
 
 
-def _render_dashboard_body() -> None:
+def _render_price_chart_panel() -> None:
+    st.plotly_chart(_build_figure(), width="stretch", key="price_chart")
+    if engine.state.prices:
+        latest = engine.state.prices[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+        st.caption(f"Last updated: {latest}")
+
+
+def _render_runtime_panel() -> None:
     heartbeat_frames = ["●○○", "○●○", "○○●"]
     frame_idx = st.session_state.get("heartbeat_frame_idx", 0)
     st.session_state["heartbeat_frame_idx"] = (frame_idx + 1) % len(heartbeat_frames)
 
-    graph_col, pnl_col = st.columns([8, 2])
-    with graph_col:
-        st.plotly_chart(_build_figure(), width="stretch", key="price_chart")
-        if engine.state.prices:
-            latest = engine.state.prices[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
-            st.caption(f"Last updated: {latest}")
+    st.markdown("### Runtime")
+    runtime_rows = [
+        {"item": "Live heartbeat", "value": heartbeat_frames[frame_idx]},
+        {"item": "Price loop", "value": "continuous (auto-rate)"},
+        {"item": "Rate-limit backoff", "value": f"{engine.current_poll_interval_seconds:.1f}s"},
+        {"item": "Jev decision interval", "value": f"{engine.jev_interval_seconds:.0f}s"},
+        {
+            "item": "Next price update",
+            "value": _format_countdown(engine.seconds_until_next_price_update()),
+        },
+        {
+            "item": "Next Jev decision",
+            "value": _format_countdown(engine.seconds_until_next_decision()),
+        },
+        {
+            "item": "Outlook",
+            "value": engine.current_outlook.title() if engine.current_outlook is not None else "-",
+        },
+        {
+            "item": "Next halving estimate",
+            "value": (
+                engine.state.next_halving_at.strftime("%Y-%m-%d %H:%M UTC")
+                if engine.state.next_halving_at is not None
+                else "-"
+            ),
+        },
+    ]
+    st.dataframe(runtime_rows, width="stretch", hide_index=True)
 
-    with pnl_col:
-        st.markdown("### Runtime")
-        runtime_rows = [
-            {"item": "Live heartbeat", "value": heartbeat_frames[frame_idx]},
-            {"item": "Price loop", "value": "continuous (auto-rate)"},
-            {"item": "Rate-limit backoff", "value": f"{engine.current_poll_interval_seconds:.1f}s"},
-            {"item": "Jev decision interval", "value": f"{engine.jev_interval_seconds:.0f}s"},
-            {
-                "item": "Next price update",
-                "value": _format_countdown(engine.seconds_until_next_price_update()),
-            },
-            {
-                "item": "Next Jev decision",
-                "value": _format_countdown(engine.seconds_until_next_decision()),
-            },
-            {
-                "item": "Outlook",
-                "value": engine.current_outlook.title() if engine.current_outlook is not None else "-",
-            },
-            {
-                "item": "Next halving estimate",
-                "value": (
-                    engine.state.next_halving_at.strftime("%Y-%m-%d %H:%M UTC")
-                    if engine.state.next_halving_at is not None
-                    else "-"
-                ),
-            },
-        ]
-        st.dataframe(runtime_rows, width="stretch", hide_index=True)
+    st.markdown("### Paper Book")
+    summary = engine.paper_book_summary
+    st.metric("Starting Cash", f"${summary['starting_cash']:,.2f}")
+    st.metric("Cash Balance", f"${summary['cash_balance']:,.2f}")
+    st.metric("Realized P/L", f"${summary['realized_pnl']:,.2f}")
 
-        st.markdown("### Paper Book")
-        summary = engine.paper_book_summary
-        st.metric("Starting Cash", f"${summary['starting_cash']:,.2f}")
-        st.metric("Cash Balance", f"${summary['cash_balance']:,.2f}")
-        st.metric("Realized P/L", f"${summary['realized_pnl']:,.2f}")
+
+def _render_activity_panel() -> None:
 
     st.markdown("### Transactions made")
     if engine.state.settled_trades:
@@ -330,12 +324,47 @@ def _render_dashboard_body() -> None:
             st.code(dead)
 
 
-@st.fragment(run_every="5s")
-def render_live_dashboard_polling() -> None:
-    _render_dashboard_body()
+def _render_dashboard_body() -> None:
+    graph_col, pnl_col = st.columns([8, 2])
+    with graph_col:
+        _render_price_chart_panel()
+    with pnl_col:
+        _render_runtime_panel()
+    _render_activity_panel()
+
+
+@st.fragment(run_every=f"{CHART_REFRESH_SECONDS}s")
+def render_live_chart_polling(chart_slot, chart_meta_slot) -> None:
+    signature = _chart_signature()
+    if st.session_state.get("chart_render_signature") != signature:
+        chart_slot.plotly_chart(_build_figure(), width="stretch", key="price_chart")
+        st.session_state["chart_render_signature"] = signature
+
+    if engine.state.prices:
+        latest = engine.state.prices[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+        chart_meta_slot.caption(f"Last updated: {latest}")
+    else:
+        chart_meta_slot.caption("Last updated: -")
+
+
+@st.fragment(run_every=f"{PANEL_REFRESH_SECONDS}s")
+def render_live_runtime_panel_polling() -> None:
+    _render_runtime_panel()
+
+
+@st.fragment(run_every=f"{PANEL_REFRESH_SECONDS}s")
+def render_live_activity_polling() -> None:
+    _render_activity_panel()
 
 
 if engine.is_running:
-    render_live_dashboard_polling()
+    graph_col, pnl_col = st.columns([8, 2])
+    with graph_col:
+        chart_slot = st.empty()
+        chart_meta_slot = st.empty()
+        render_live_chart_polling(chart_slot, chart_meta_slot)
+    with pnl_col:
+        render_live_runtime_panel_polling()
+    render_live_activity_polling()
 else:
     _render_dashboard_body()

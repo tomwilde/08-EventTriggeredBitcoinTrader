@@ -25,12 +25,6 @@ from .scheduler import NonOverlappingScheduler, run_with_retries
 from .trading import OpenTrade, PaperBook
 
 STARTUP_EMA_WINDOWS: dict[str, timedelta] = {
-    "1_month": timedelta(days=30),
-    "3_weeks": timedelta(weeks=3),
-    "2_weeks": timedelta(weeks=2),
-    "1_week": timedelta(weeks=1),
-    "3_day": timedelta(days=3),
-    "1_day": timedelta(days=1),
     "12_hours": timedelta(hours=12),
     "6_hours": timedelta(hours=6),
     "1_hour": timedelta(hours=1),

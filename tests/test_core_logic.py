@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+import requests
 
 from event_agent.indicators import moving_average_series
 from event_agent.models import Movement, Prediction
@@ -229,12 +230,6 @@ def test_phase2_startup_initialization_builds_outlook_and_ema_windows(monkeypatc
     assert engine.state.startup_complete is True
     assert engine.state.market_outlook == "bullish"
     assert set(engine.state.startup_emas) == {
-        "1_month",
-        "3_weeks",
-        "2_weeks",
-        "1_week",
-        "3_day",
-        "1_day",
         "12_hours",
         "6_hours",
         "1_hour",
@@ -330,3 +325,279 @@ def test_openrouter_jev_advisor_uses_decisions_endpoint(monkeypatch: pytest.Monk
     assert decision.action == "BUY"
     assert decision.confidence == pytest.approx(0.75)
     assert decision.rationale_token == "ema_structure"
+
+
+def test_ollama_jev_advisor_normalizes_host_and_retries(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.prediction import OllamaJevAdvisor
+
+    captured: dict[str, object] = {}
+    attempts = {"count": 0}
+    sleeps: list[int] = []
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return {
+                "response": '{"action":"BUY","confidence":0.8,"rationale_token":"ema_structure"}'
+            }
+
+    def _fake_post(url: str, *, json, timeout):
+        attempts["count"] += 1
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        if attempts["count"] < 3:
+            raise requests.ConnectionError("ollama not ready")
+        return _Response()
+
+    monkeypatch.setattr("event_agent.prediction.requests.post", _fake_post)
+
+    advisor = OllamaJevAdvisor(
+        host="0.0.0.0:11434",
+        model="llama3.2:3b",
+        sleep_func=sleeps.append,
+    )
+
+    decision = advisor.decide(
+        snapshot={"trend": {"ema_cross": "BULLISH_CROSS"}},
+        outlook="bullish",
+        now=datetime(2026, 11, 7, tzinfo=UTC),
+    )
+
+    assert attempts["count"] == 3
+    assert sleeps == [1, 2]
+    assert captured["url"] == "http://0.0.0.0:11434/api/generate"
+    assert captured["json"]["model"] == "llama3.2:3b"
+    assert captured["timeout"] == 60
+    assert decision.action == "BUY"
+    assert decision.confidence == pytest.approx(0.8)
+    assert decision.rationale_token == "ema_structure"
+
+
+def test_ollama_outlook_analyzer_uses_same_retry_wrapper(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.models import NewsItem
+    from event_agent.prediction import OllamaOutlookAnalyzer
+
+    attempts = {"count": 0}
+    sleeps: list[int] = []
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return {"response": '{"outlook":"bearish"}'}
+
+    def _fake_post(url: str, *, json, timeout):
+        attempts["count"] += 1
+        captured["json"] = json
+        captured["timeout"] = timeout
+        if attempts["count"] == 1:
+            raise requests.Timeout("slow startup")
+        return _Response()
+
+    monkeypatch.setattr("event_agent.prediction.requests.post", _fake_post)
+
+    analyzer = OllamaOutlookAnalyzer(
+        host="http://localhost:11434",
+        model="llama3.2:3b",
+        sleep_func=sleeps.append,
+    )
+
+    outlook = analyzer.analyze(
+        stories=[
+            NewsItem(
+                source="bbc",
+                story_id="story-1",
+                title="Risk rises",
+                summary="decline signs",
+                published_at=datetime(2026, 11, 7, tzinfo=UTC),
+            )
+        ],
+        startup_emas={"1_day": 1.0, "1_month": 2.0},
+        next_halving_at=datetime(2028, 4, 20, tzinfo=UTC),
+        now=datetime(2026, 11, 7, tzinfo=UTC),
+    )
+
+    assert attempts["count"] == 2
+    assert sleeps == [1]
+    assert captured["timeout"] == 60
+    assert captured["json"]["options"] == {
+        "num_gpu": -1,
+        "num_ctx": 4096,
+        "low_vram": False,
+    }
+    assert outlook == "bearish"
+
+
+def test_ollama_first_call_retries_until_warm(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.prediction import OllamaJevAdvisor
+
+    attempts = {"count": 0}
+    sleeps: list[int] = []
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return {
+                "response": '{"action":"HOLD","confidence":0.5,"rationale_token":"no_edge"}'
+            }
+
+    def _fake_post(url: str, *, json, timeout):
+        attempts["count"] += 1
+        if attempts["count"] < 5:
+            raise requests.Timeout("model still loading")
+        return _Response()
+
+    monkeypatch.setattr("event_agent.prediction.requests.post", _fake_post)
+
+    advisor = OllamaJevAdvisor(
+        host="http://localhost:11434",
+        model="gemma4:12b",
+        sleep_func=sleeps.append,
+    )
+    decision = advisor.decide(
+        snapshot={"trend": {"ema_cross": "BULLISH_CROSS"}},
+        outlook="bullish",
+        now=datetime(2026, 11, 7, tzinfo=UTC),
+    )
+
+    assert attempts["count"] == 5
+    assert sleeps == [1, 2, 4, 8]
+    assert decision.action == "HOLD"
+
+
+def test_ollama_jev_advisor_handles_non_json_output(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.prediction import OllamaJevAdvisor
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return {
+                "response": "I think BUY here. momentum is strong"
+            }
+
+    def _fake_post(url: str, *, json, timeout):
+        return _Response()
+
+    monkeypatch.setattr("event_agent.prediction.requests.post", _fake_post)
+
+    advisor = OllamaJevAdvisor(
+        host="http://localhost:11434",
+        model="gemma4:e2b",
+        sleep_func=lambda _: None,
+    )
+    decision = advisor.decide(
+        snapshot={"trend": {"ema_cross": "BULLISH_CROSS"}},
+        outlook="bullish",
+        now=datetime(2026, 11, 7, tzinfo=UTC),
+    )
+
+    assert decision.action == "BUY"
+    assert decision.confidence == pytest.approx(0.5)
+    assert decision.rationale_token == "no_edge"
+
+
+def test_ollama_outlook_analyzer_handles_non_json_output(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.models import NewsItem
+    from event_agent.prediction import OllamaOutlookAnalyzer
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, object]:
+            return {"response": "Market sentiment looks bearish overall today."}
+
+    def _fake_post(url: str, *, json, timeout):
+        return _Response()
+
+    monkeypatch.setattr("event_agent.prediction.requests.post", _fake_post)
+
+    analyzer = OllamaOutlookAnalyzer(
+        host="http://localhost:11434",
+        model="gemma4:12b",
+        sleep_func=lambda _: None,
+    )
+
+    outlook = analyzer.analyze(
+        stories=[
+            NewsItem(
+                source="bbc",
+                story_id="story-1",
+                title="Risk rises",
+                summary="decline signs",
+                published_at=datetime(2026, 11, 7, tzinfo=UTC),
+            )
+        ],
+        startup_emas={"1_day": 1.0, "1_month": 2.0},
+        next_halving_at=datetime(2028, 4, 20, tzinfo=UTC),
+        now=datetime(2026, 11, 7, tzinfo=UTC),
+    )
+
+    assert outlook == "bearish"
+
+
+def test_build_outlook_analyzer_uses_system_two_model(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.prediction import OllamaOutlookAnalyzer, build_outlook_analyzer
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("USE_OLLAMA", "1")
+    monkeypatch.setenv("OLLAMA_HOST", "host.docker.internal:11434")
+    monkeypatch.setenv("SYSTEM_TWO_MODEL", "gemma4:12b")
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+
+    analyzer = build_outlook_analyzer()
+
+    assert isinstance(analyzer, OllamaOutlookAnalyzer)
+    assert analyzer._client._host == "http://host.docker.internal:11434"
+    assert analyzer._client._model == "gemma4:12b"
+
+
+def test_build_jev_advisor_uses_system_one_model(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.prediction import OllamaJevAdvisor, build_jev_advisor
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("USE_OLLAMA", "1")
+    monkeypatch.setenv("OLLAMA_HOST", "host.docker.internal:11434")
+    monkeypatch.setenv("SYSTEM_ONE_MODEL", "gemma4:e2b")
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+
+    advisor = build_jev_advisor()
+
+    assert isinstance(advisor, OllamaJevAdvisor)
+    assert advisor._client._host == "http://host.docker.internal:11434"
+    assert advisor._client._model == "gemma4:e2b"
+
+
+def test_build_outlook_analyzer_openrouter_uses_system_two_model(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.prediction import OpenRouterOutlookAnalyzer, build_outlook_analyzer
+
+    monkeypatch.setenv("USE_OLLAMA", "0")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    monkeypatch.setenv("SYSTEM_TWO_MODEL", "openai/gpt-5-mini")
+
+    analyzer = build_outlook_analyzer()
+
+    assert isinstance(analyzer, OpenRouterOutlookAnalyzer)
+    assert analyzer.model == "openai/gpt-5-mini"
+
+
+def test_build_jev_advisor_openrouter_uses_system_one_model(monkeypatch: pytest.MonkeyPatch):
+    from event_agent.prediction import OpenRouterJevAdvisor, build_jev_advisor
+
+    monkeypatch.setenv("USE_OLLAMA", "0")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    monkeypatch.setenv("SYSTEM_ONE_MODEL", "typesafe/jev-2")
+
+    advisor = build_jev_advisor()
+
+    assert isinstance(advisor, OpenRouterJevAdvisor)
+    assert advisor.model == "typesafe/jev-2"
